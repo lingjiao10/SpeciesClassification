@@ -4,6 +4,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 from PIL import Image
 
+import torch
 from torchvision.datasets.utils import download_and_extract_archive, verify_str_arg
 from torchvision.datasets.vision import VisionDataset
 
@@ -74,7 +75,8 @@ class INaturalist(VisionDataset):
         download: bool = False,
         build_tree = False,
         load_weight = False,
-        tree_depth = 7,
+        tree_depth = 4,
+        insecta = False, #只加载insecta的图像，暂不使用
     ) -> None:
         self.version = verify_str_arg(version, "version", DATASET_URLS.keys())
 
@@ -101,23 +103,32 @@ class INaturalist(VisionDataset):
         self.cat_table = None
         # distance between each category -> calculated by category tree
         self.full_distance_matrix = []
+        # fully connection layers weights based on category tree
+        self.tree_layer_connection = []
         
 
         if not isinstance(target_type, list):
             target_type = [target_type]
         if self.version[:4] == "2021":
             self.target_type = [verify_str_arg(t, "target_type", ("full", *CATEGORIES_2021)) for t in target_type]
-            self._init_2021()
+            print('target_type, ', target_type)
+            if insecta: 
+                self._init_2021_insecta()
+            else:
+                self._init_2021()
             if build_tree:
                 print('---------------> Start building tree of all categories......')
                 self._build_tree(tree_depth)
                 print('---------------> Building tree of all categories Finished.')
-                print('---------------> Start calculating distance of all leaves......')
-                self._build_distance_matrix(tree_depth)
-                print('---------------> Calculating distance of all leaves Finished.')
+                self.tree_layer_connection = self.cal_treelayer_conntection()
+
+                # if not load_weight:
+                #     print('---------------> Start calculating distance of all leaves......')
+                #     self._build_distance_matrix(tree_depth)
+                #     print('---------------> Calculating distance of all leaves Finished.')
             if load_weight:
                 print('---------------> loading distance matrix......')
-                self.full_distance_matrix = np.loadtxt("./full_distance_matrix_4.csv", delimiter=',')
+                # self.full_distance_matrix = np.loadtxt("./full_distance_matrix_4.csv", delimiter=',')
         else:
             self.target_type = [verify_str_arg(t, "target_type", ("full", "super")) for t in target_type]
             self._init_pre2021()
@@ -129,6 +140,49 @@ class INaturalist(VisionDataset):
             files = os.listdir(os.path.join(self.root, dir_name))
             for fname in files:
                 self.index.append((dir_index, fname))
+
+    def _init_2021_insecta(self) -> None:
+        """
+        Initialize based on 2021 layout
+        Filter class by Insecta //wangcong
+        """
+
+        self.all_categories = sorted(os.listdir(self.root))
+
+        # map: category type -> name of category -> index
+        self.categories_index = {k: {} for k in CATEGORIES_2021}
+
+        table = []
+        for dir_index, dir_name in enumerate(self.all_categories):
+            pieces = dir_name.split("_")
+            if 'Insecta' not in pieces:
+                continue
+
+            # print(dir_name)
+            
+            if len(pieces) != 8:
+                raise RuntimeError(f"Unexpected category name {dir_name}, wrong number of pieces")
+            if pieces[0] != f"{dir_index:05d}":
+                raise RuntimeError(f"Unexpected category id {pieces[0]}, expecting {dir_index:05d}")
+            cat_map = {}
+            table.append(pieces)
+            for cat, name in zip(CATEGORIES_2021, pieces[1:7]):
+                #genus有重名，name改为[family]_[genus] //wangcong
+                if cat == 'genus':
+                    name = pieces[5]+'_'+name
+
+                if name in self.categories_index[cat]:
+                    cat_id = self.categories_index[cat][name]
+                else:
+                    cat_id = len(self.categories_index[cat])
+                    self.categories_index[cat][name] = cat_id
+                cat_map[cat] = cat_id
+            self.categories_map.append(cat_map)
+
+        if len(table) > 0:
+            self.cat_table = pd.DataFrame(table, columns=['ID', *CATEGORIES_2021, 'speicies'])
+            self.cat_table.set_index('ID')
+            self.cat_table.to_csv('cat_table.csv', index=False)
 
 
     def _init_2021(self) -> None:
@@ -150,6 +204,10 @@ class INaturalist(VisionDataset):
             cat_map = {}
             table.append(pieces)
             for cat, name in zip(CATEGORIES_2021, pieces[1:7]):
+                #genus有重名，name改为[family]_[genus] //wangcong
+                if cat == 'genus':
+                    name = pieces[5]+'_'+name
+
                 if name in self.categories_index[cat]:
                     cat_id = self.categories_index[cat][name]
                 else:
@@ -273,10 +331,77 @@ class INaturalist(VisionDataset):
         self.category_tree = Tree()
         rootnode = Node(tag=0, identifier=0)  #root node
         self.category_tree.add_node(rootnode)
-        self._addchildren(rootnode, 0, stop_idx=stop_idx)
+        self._addchildren_new(rootnode, 0, stop_idx=stop_idx)
 
         print("depth of tree: ", self.category_tree.depth())
 
+    def _addchildren_new(self, parent, category_type_index, grandparent_tag=None, stop_idx=7):
+        """
+        递归添加节点
+        # kingdom/species的identifer：id_name
+        # 其余的：id_parentname_name
+
+        identifer采用category_map中的[id]_[name]
+        """
+        # if category_type_index == len(CATEGORIES_2021)+1:
+        if category_type_index == stop_idx:
+            return #stop recursion
+
+
+        if category_type_index == 0: 
+            category_type = CATEGORIES_2021[category_type_index] #current children source
+            # print('current children source: ', category_type)
+            for name, id in self.categories_index[category_type].items():
+                # node = Node(tag=name, identifier=str(id) + '_' +name)
+                node = Node(tag=name, identifier=str(id) + '_' +name)
+                self.category_tree.add_node(node, parent=parent)
+                # print("add node -> ", node.identifier)
+                self._addchildren_new(node, category_type_index + 1, stop_idx=stop_idx)
+        else:
+            #filter children by parent name
+            if category_type_index == len(CATEGORIES_2021):
+                children_cat_type = 'speicies'
+            else:
+                children_cat_type = CATEGORIES_2021[category_type_index] #current children source
+            parent_cat_type = CATEGORIES_2021[category_type_index-1]
+
+            #search children add grandparent's filter
+            if category_type_index == len(CATEGORIES_2021): # as genus maybe dumplicated in different kingdom
+                grandparent_cat_type = CATEGORIES_2021[category_type_index-2]
+                children = self.cat_table.loc[
+                (self.cat_table[parent_cat_type] == parent.tag) & (self.cat_table[grandparent_cat_type] == grandparent_tag), children_cat_type
+                ].drop_duplicates()
+            else:
+                children = self.cat_table.loc[
+                self.cat_table[parent_cat_type] == parent.tag, children_cat_type
+                ].drop_duplicates()
+
+            # print(children)
+            for label, child in children.items():
+                name = child
+                if category_type_index == len(CATEGORIES_2021):
+                    child_id = label
+                elif category_type_index == len(CATEGORIES_2021) - 1: #genus
+                    # child_id = str(self.categories_index[children_cat_type][name]) + "_" + parent.tag
+                    child_id = str(self.categories_index[children_cat_type][parent.tag + '_' + name]) + '_' + parent.tag
+                else:
+                    child_id = self.categories_index[children_cat_type][name]
+
+                # node = Node(tag=name, identifier=str(child_id) + '_' +name)
+                node = Node(tag=name, identifier=str(child_id) + '_' +name)
+                try:
+                    self.category_tree.add_node(node, parent=parent)
+                except:
+                    # print(e)
+                    print("error -> ", node.identifier, parent.identifier)
+                # print("add node -> ", node.identifier)
+
+                # if category_type_index == len(CATEGORIES_2021):
+                #     continue #stop recursion
+                # else:
+                self._addchildren_new(node, category_type_index + 1, parent.tag, stop_idx)
+
+    # @Deprecated
     def _addchildren(self, parent, category_type_index, grandparent_tag=None, stop_idx=7):
         """
         递归添加节点
@@ -382,14 +507,43 @@ class INaturalist(VisionDataset):
         file.close()
         # np.savetxt('full_distance_matrix--.csv', self.full_distance_matrix, delimiter=",")
         # pd.
+
+    def cal_treelayer_conntection(self):
+        depth = self.category_tree.depth()
+        tree = self.category_tree
+        weights = []
+        for i in range(depth):
+            depth_i = depth - i
+            # print(depth_i)
+            if depth_i == 1:
+                break
+            # depth_i --> depth_i-1
+            weight = torch.zeros([tree.size(depth_i), tree.size(depth_i-1)])
+            # print(weight.size())
+            for j in range(tree.size(depth_i)):
+                if depth_i == 7:
+                    node_id = str(j) + '_' + self.all_categories[j].split('_')[7]
+                else:
+                    node_id = str(j) + '_' + list(self.categories_index[CATEGORIES_2021[depth_i-1]].keys())[j]
+                parent = tree.parent(node_id)
+                parent_id = parent.identifier
+                parent_index = int(parent_id.split('_')[0])
+                weight[j][parent_index] = 1
+            weights.append(weight)
+        return weights        
         
 
 
 
 if __name__ == "__main__":
-    nature = INaturalist("h:/Datasets/iNaturalist/", version='2021_valid',target_type="genus", build_tree=True,
-        tree_depth=4)
+    # nature = INaturalist("h:/Datasets/iNaturalist/", version='2021_valid',target_type="genus", build_tree=True,
+    #     tree_depth=4)
+    nature = INaturalist("h:/Datasets/iNaturalist/", version='2021_valid',target_type=["full"], build_tree=True,load_weight=True)
     print(len(nature))
-    print(nature[0])
+    print(nature[100])
+    print(nature.index[100])
     # print(nature.all_categories)
     print(nature.category_tree.depth())
+    # print(nature.tree_layer_connection[4])
+
+

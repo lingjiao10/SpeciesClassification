@@ -25,6 +25,8 @@ from datasets.inaturalist import INaturalist
 from torch.utils.tensorboard import SummaryWriter
 import matplotlib.pyplot as plt
 import numpy as np
+from sklearn import metrics
+import itertools
 
 from generalized_wasserstein_dice_loss.loss import GeneralizedWassersteinDiceLoss
 from myloss import BCEWithSoftmaxLoss, BCEWithSoftmaxFocalLoss
@@ -36,7 +38,7 @@ model_names = sorted(name for name in models.__dict__
 parser = argparse.ArgumentParser(description='iNaturalist Training, using Pytorch ImageNet training code')
 parser.add_argument('data', metavar='DIR', nargs='?', default='iNaturalist',
                     help='path to dataset (default: iNaturalist)')
-parser.add_argument('--target-type', type=str, default='full', choices=["full", "kingdom", "phylum", 
+parser.add_argument('--target-type', nargs='+', type=str, default='full', choices=["full", "kingdom", "phylum", 
                     "class", "order", "family", "genus", "super"], help='Type of target to use')
 parser.add_argument('-a', '--arch', metavar='ARCH', default='resnet18',
                     choices=model_names,
@@ -90,7 +92,7 @@ parser.add_argument('--dummy', action='store_true', help="use fake data to bench
 parser.add_argument('--output-dir', default='./runs/train/exp', type=str,
                     help='tensorboard output directory')
 parser.add_argument('--loss', default='CrossEntropyLoss', type=str, choices=['CrossEntropyLoss', 'BCELoss',
-            'BCEWithLogitsLoss', 'GWDL', 'BCEWithSoftmaxLoss', 'BCEWithSoftmaxFocalLoss'], help='loss function')
+            'BCEWithLogitsLoss', 'GWDL', 'BCEWithSoftmaxLoss', 'BCEWithSoftmaxFocalLoss', 'tree_layer_loss'], help='loss function')
 parser.add_argument('--loss-reduction', default='mean', type=str, choices=['none', 'sum',
             'mean',], help='loss reduction')
 parser.add_argument('--scheduler', default='StepLR', type=str, choices=['StepLR', 'CyclicLR'],
@@ -202,6 +204,7 @@ def main_worker(gpu, ngpus_per_node, args):
         # root_dir = '../../Datasets/iNaturalist'
         root_dir = '/home/Datasets/iNaturalist'
         train_dataset = INaturalist(root=root_dir, version='2021_train_mini', target_type=args.target_type, 
+            build_tree=True,
             load_weight=args.use_weight, 
             transform=transforms.Compose([
                 transforms.RandomResizedCrop(224),
@@ -227,12 +230,13 @@ def main_worker(gpu, ngpus_per_node, args):
     if args.dummy:
         num_class =  1000
     else:
-        if args.target_type == 'full':
+        if 'full' in args.target_type:
             num_class = 10000
         else:
-            num_class = len(train_dataset.categories_index[args.target_type])
+            num_class = len(train_dataset.categories_index[args.target_type[0]])
 
     args.num_class = num_class
+    print('num_class', num_class)
 
     if args.pretrained:
         print("=> using pre-trained model '{}'".format(args.arch))
@@ -309,12 +313,12 @@ def main_worker(gpu, ngpus_per_node, args):
     elif args.loss == 'BCEWithLogitsLoss':
         criterion = nn.BCEWithLogitsLoss(reduction=args.loss_reduction).to(device)
     elif args.loss == 'GWDL':
-        criterion = GeneralizedWassersteinDiceLoss(dist_matrix=distance_matrix)
+        criterion = GeneralizedWassersteinDiceLoss(dist_matrix=distance_matrix, adding_ce=True, gamma=3)
     elif args.loss == 'BCEWithSoftmaxLoss':
         # print('hi')
         criterion = BCEWithSoftmaxLoss(reduction=args.loss_reduction).to(device)
     elif args.loss == 'BCEWithSoftmaxFocalLoss':
-        criterion = BCEWithSoftmaxFocalLoss(reduction=args.loss_reduction).to(device)        
+        criterion = BCEWithSoftmaxFocalLoss(reduction=args.loss_reduction).to(device)      
     else:
         # print('wrong')
         criterion = nn.CrossEntropyLoss().to(device)
@@ -350,6 +354,7 @@ def main_worker(gpu, ngpus_per_node, args):
             #     # best_acc1 may be from a checkpoint from a different GPU
             #     best_acc1 = best_acc1.to(args.gpu) #'float' object has no attribute 'to'
             model.load_state_dict(checkpoint['state_dict'])
+            # print(checkpoint['state_dict'])
             optimizer.load_state_dict(checkpoint['optimizer'])
             scheduler.load_state_dict(checkpoint['scheduler'])
             print("=> loaded checkpoint '{}' (epoch {})"
@@ -374,22 +379,51 @@ def main_worker(gpu, ngpus_per_node, args):
         val_dataset, batch_size=args.batch_size, shuffle=False,
         num_workers=args.workers, pin_memory=True, sampler=val_sampler)
 
-    if args.evaluate:
-        validate(val_loader, model, criterion, args, distance_matrix=distance_matrix)
-        return
+    treelayer_connection = train_dataset.tree_layer_connection #用于分层计算loss，权重固定
+    lamda_list = [[0,0,0,1],[0,0,0.5,0.5],[0.1,0.8,0.1,0],[0.8,0.15,0.05,0]]
+
+    # lamda_list = [[0.05,0.05,0.5,0.4],[0.1,0.5,0.3,0.1],[0.2,0.7,0.1,0],[0.8,0.15,0.05,0]]
 
     # create summary writer for tensorboard
     summary_writer = SummaryWriter(log_dir=args.output_dir)
+
+    if args.evaluate:
+        # test saved checkpoint TODO
+        # if args.rank in {-1, 0}:
+        #     print('Vis model......')
+        #     dummy_input = torch.rand(20,3,224,224)
+        #     summary_writer.add_graph(model, (dummy_input,))
+
+        validate(val_loader, model, criterion, args, distance_matrix=distance_matrix, treelayer_connection=treelayer_connection, 
+            device=device, plot_cm=True)
+        return
+
+
 
     for epoch in range(args.start_epoch, args.epochs):
         if args.distributed:
             train_sampler.set_epoch(epoch)
 
+        if args.loss == "tree_layer_loss":
+            if epoch < 2: 
+                lamda = lamda_list[0]
+            elif epoch < 5 : 
+                lamda = lamda_list[1]
+            elif epoch < 10 :
+                lamda = lamda_list[2]
+            else:
+                lamda = lamda_list[3]
+        else:
+            lamda = None
+
         # train for one epoch
-        train(train_loader, model, criterion, optimizer, epoch, device, args, summary_writer, distance_matrix, scheduler)
+        train(train_loader, model, criterion, optimizer, epoch, device, args, summary_writer, distance_matrix, scheduler, treelayer_connection, lamda)
 
         # evaluate on validation set
-        acc1 = validate(val_loader, model, criterion, args, summary_writer, epoch, distance_matrix)
+        plot_cm = False
+        if epoch == args.epochs-1: 
+            plot_cm = True
+        acc1 = validate(val_loader, model, criterion, args, summary_writer, epoch, distance_matrix, treelayer_connection, device, plot_cm=plot_cm)
         if args.rank in {-1, 0}:
             summary_writer.add_scalar('validation_acc@1', acc1, epoch)
         
@@ -415,7 +449,7 @@ def main_worker(gpu, ngpus_per_node, args):
 
 
 def train(train_loader, model, criterion, optimizer, epoch, device, args, summary_writer, 
-    distance_matrix, scheduler):
+    distance_matrix, scheduler, treelayer_connection=[], lamda=None):
 
     batch_time = AverageMeter('Time', ':6.3f')
     data_time = AverageMeter('Data', ':6.3f')
@@ -423,10 +457,27 @@ def train(train_loader, model, criterion, optimizer, epoch, device, args, summar
     losses = AverageMeter('Loss', ':.4e')
     top1 = AverageMeter('Acc@1', ':6.2f')
     top5 = AverageMeter('Acc@5', ':6.2f')
+
     progress = ProgressMeter(
         len(train_loader),
         [batch_time, data_time, lr, losses, top1, top5],
         prefix="Epoch: [{}]".format(epoch))
+
+    if args.loss == "tree_layer_loss":
+        tree_losses = AverageMeter('Treeloss', ':.4e') #wangcong
+        # family_top1 = AverageMeter('FamilyAcc@1', ':6.2f')
+        # order_top1 = AverageMeter('OrderAcc@1', ':6.2f')
+        class_top1 = AverageMeter('ClassAcc@1', ':6.2f')        
+        phylum_top1 = AverageMeter('PhylumAcc@1', ':6.2f')
+        kingdom_top1 = AverageMeter('KingdomAcc@1', ':6.2f')
+        progress = ProgressMeter(
+            len(train_loader),
+            [batch_time, data_time, lr, losses, tree_losses, top1, top5, class_top1, phylum_top1, kingdom_top1],
+            prefix="Epoch: [{}]".format(epoch))
+        # progress = ProgressMeter(
+        #     len(train_loader),
+        #     [batch_time, data_time, lr, losses, tree_losses, top1, top5, family_top1, order_top1, class_top1, phylum_top1,kingdom_top1],
+        #     prefix="Epoch: [{}]".format(epoch))
 
     # switch to train mode
     model.train()
@@ -434,13 +485,20 @@ def train(train_loader, model, criterion, optimizer, epoch, device, args, summar
     end = time.time()
     if args.lr_range_test:
         lr_top1_loss = []
-    for i, (images, target) in enumerate(train_loader):
+    for i, (images, target_all) in enumerate(train_loader):
         # measure data loading time
         data_time.update(time.time() - end)
 
         # move data to the same device as model
         images = images.to(device, non_blocking=True)
+        
+        if isinstance(target_all, list):
+            target = target_all[0]
+        else:
+            target = target_all
+
         target = target.to(device, non_blocking=True)
+
 
         if args.loss.startswith('BCE'):
             target_one_hot = nn.functional.one_hot(target, num_classes=args.num_class).float()
@@ -450,16 +508,50 @@ def train(train_loader, model, criterion, optimizer, epoch, device, args, summar
         else:
             target_one_hot = target
 
+        
+
         # compute output
         output = model(images)
         # print(criterion)
         loss = criterion(output, target_one_hot)
+
+
+        layer_top1 = []
+        if args.loss == "tree_layer_loss":
+            loss = loss * lamda[0]
+            other_targets= target_all[1:]
+            tree_loss = 0
+            layer_output = output
+            layer_depth = 0
+            for weight in treelayer_connection:
+                layer_output = layer_output @ weight.to(device)
+                tree_loss += criterion(layer_output, other_targets[layer_depth].to(device)) * 0.1 * (len(treelayer_connection) - layer_depth)
+                layer_top1.append(accuracy(layer_output, other_targets[layer_depth].to(device))[0])
+                # print('layer_top1: ', layer_top1)
+                layer_depth += 1
+                tree_loss = tree_loss * lamda[layer_depth]
+
+            # loss += (tree_loss / len(treelayer_connection))
+            loss += tree_loss
+
 
         # measure accuracy and record loss
         acc1, acc5 = accuracy(output, target, topk=(1, 5))
         losses.update(loss.item(), images.size(0))
         top1.update(acc1[0], images.size(0))
         top5.update(acc5[0], images.size(0))
+        if args.loss == "tree_layer_loss":
+            tree_losses.update(tree_loss.item(), images.size(0))
+            class_top1.update(layer_top1[0][0], images.size(0))
+            phylum_top1.update(layer_top1[1][0], images.size(0))
+            kingdom_top1.update(layer_top1[2][0], images.size(0))
+
+            # family_top1.update(layer_top1[1][0], images.size(0))
+            # order_top1.update(layer_top1[2][0], images.size(0))
+            # class_top1.update(layer_top1[3][0], images.size(0))
+            # phylum_top1.update(layer_top1[4][0], images.size(0))
+            # kingdom_top1.update(layer_top1[5][0], images.size(0))
+
 
         # compute gradient and do SGD step
         optimizer.zero_grad()
@@ -476,6 +568,11 @@ def train(train_loader, model, criterion, optimizer, epoch, device, args, summar
                 summary_writer.add_scalar('lr', lr.val, i)
                 summary_writer.add_scalar('Acc@1_iter', top1.val, i)
                 summary_writer.add_scalar('loss_iter', losses.val, i)
+                summary_writer.add_scalars('Layer_Acc@1', {'order_top1':top1.val, 
+                'class_top1':class_top1.val, 'phylum_top1':phylum_top1.val, 'kingdom_top1':kingdom_top1.val}, i)
+                # summary_writer.add_scalars('Layer_Acc@1', {'family_top1':family_top1.val, 'order_top1':order_top1.val, 
+                # 'class_top1':class_top1.val, 'phylum_top1':phylum_top1.val, 'kingdom_top1':kingdom_top1.val}, i)
+                
 
             
 
@@ -493,6 +590,13 @@ def train(train_loader, model, criterion, optimizer, epoch, device, args, summar
         summary_writer.add_scalar('train_loss', losses.avg, epoch)
         summary_writer.add_scalar('train_Acc@1', top1.avg, epoch)
         summary_writer.add_scalar('train_Acc@5', top5.avg, epoch)
+        if args.loss == "tree_layer_loss":
+            summary_writer.add_scalar('train_tree_loss', tree_losses.avg, epoch)
+            summary_writer.add_scalars('train_Layer_Acc@1', {'order_top1':top1.avg, 
+                'class_top1':class_top1.avg, 'phylum_top1':phylum_top1.avg, 'kingdom_top1':kingdom_top1.avg}, epoch)
+
+            # summary_writer.add_scalars('train_Layer_Acc@1', {'family_top1':family_top1.avg, 'order_top1':order_top1.avg, 
+            #     'class_top1':class_top1.avg, 'phylum_top1':phylum_top1.avg, 'kingdom_top1':kingdom_top1.avg}, epoch)
 
 
         if args.lr_range_test:
@@ -517,9 +621,11 @@ def train(train_loader, model, criterion, optimizer, epoch, device, args, summar
 
 
 
-def validate(val_loader, model, criterion, args, summary_writer=None, epoch=None, distance_matrix=None):
+def validate(val_loader, model, criterion, args, summary_writer=None, epoch=None, distance_matrix=None, treelayer_connection=[], device=None, plot_cm=False):
 
     def run_validate(loader, base_progress=0):
+        confusion_matrix = None
+        layers_cm = [None, None, None]
         with torch.no_grad():
             end = time.time()
             for i, (images, target) in enumerate(loader):
@@ -529,6 +635,13 @@ def validate(val_loader, model, criterion, args, summary_writer=None, epoch=None
                 # if torch.backends.mps.is_available(): # torch version=1.9 has no this para
                 #     images = images.to('mps')
                 #     target = target.to('mps')
+
+                if isinstance(target, list):
+                    target_all = target
+                    target = target_all[0]
+                    other_targets= target_all[1:]
+                    
+
                 if torch.cuda.is_available():
                     target = target.cuda(args.gpu, non_blocking=True)
 
@@ -544,12 +657,97 @@ def validate(val_loader, model, criterion, args, summary_writer=None, epoch=None
                 output = model(images)
                 # print(output.size(), target_one_hot.size())
                 loss = criterion(output, target_one_hot)
+                _, _preds = torch.max(output, 1)
+                if plot_cm:
+                    if confusion_matrix is None:
+                        confusion_matrix = cal_confusion_matrix(target, _preds, labels=range(args.num_class))
+                    else:              
+                        confusion_matrix += cal_confusion_matrix(target, _preds, labels=range(args.num_class))
+
+                layer_top1 = []
+                layers_outputs = []
+                if args.loss == 'tree_layer_loss':
+                    if args.loss is None:
+                        tree_loss = 0
+                        layer_output = output
+                        layer_depth = 0
+                        for weight in treelayer_connection:
+                            layer_output = layer_output @ weight.to(device)
+                            layers_outputs.append(layer_output)
+                            tree_loss += criterion(layer_output, other_targets[layer_depth].to(device)) * 0.1 * (len(treelayer_connection) - layer_depth)
+                            layer_top1.append(accuracy(layer_output, other_targets[layer_depth].to(device))[0])
+
+                            _, _layer_preds = torch.max(layer_output, 1)
+                            if plot_cm:
+                                layer_cm = cal_confusion_matrix(other_targets[layer_depth], _layer_preds, labels=range(layer_output.size()[1]))
+                                if layers_cm[layer_depth] is None:
+                                    layers_cm[layer_depth] = layer_cm
+                                else:
+                                    layers_cm[layer_depth] += layer_cm
+
+                            layer_depth += 1
+
+                        #自上而下再计算一遍
+                        # for j in range(layer_depth):
+                        #     layer_j = layer_depth - j - 1
+                        #     weight_T = torch.transpose(treelayer_connection[layer_j], 0, 1)
+                        #     _, j_layer_output = torch.max(layers_outputs[layer_j], 1)
+                        #     j_layer_output = nn.functional.one_hot(j_layer_output, num_classes=weight_T.size()[0]).float()
+                        #     next_layer_output = j_layer_output @ weight_T.to(device)
+                            
+                        #     if layer_j < 1: #最下面一层
+                        #         output = next_layer_output * output
+                        #     else:
+                        #         filtered_output = next_layer_output * layers_outputs[layer_j - 1]
+                        #         # 计算j+1层新的acc
+                        #         j_top1 = accuracy(filtered_output, other_targets[layer_j - 1].to(device))[0]
+                        #         layer_top1[layer_j - 1] = j_top1
+
+
+                        loss += tree_loss
+                    else:
+                        # 只计算accuracy
+                        _, layer_output = torch.max(output, 1)
+                        layer_output = nn.functional.one_hot(layer_output, num_classes=args.num_class).float()
+                        layer_depth = 0
+                        for weight in treelayer_connection:
+                            layer_output = layer_output @ weight.to(device)
+                            # tree_loss += criterion(layer_output, other_targets[layer_depth].to(device)) * 0.1 * (len(treelayer_connection) - layer_depth)
+                            layer_top1.append(accuracy(layer_output, other_targets[layer_depth].to(device))[0])
+
+                            _, _layer_preds = torch.max(layer_output, 1)
+                            if plot_cm:
+                                layer_cm = cal_confusion_matrix(other_targets[layer_depth], _layer_preds, labels=range(layer_output.size()[1]))
+                                if layers_cm[layer_depth] is None:
+                                    layers_cm[layer_depth] = layer_cm
+                                else:
+                                    layers_cm[layer_depth] += layer_cm
+
+                                # print(layer_depth, layers_cm[layer_depth])
+
+                            # print('layer_top1: ', layer_top1)
+                            layer_depth += 1
+
 
                 # measure accuracy and record loss
                 acc1, acc5 = accuracy(output, target, topk=(1, 5))
                 losses.update(loss.item(), images.size(0))
                 top1.update(acc1[0], images.size(0))
                 top5.update(acc5[0], images.size(0))
+                if args.loss == "tree_layer_loss":
+                    class_top1.update(layer_top1[0][0], images.size(0))
+                    phylum_top1.update(layer_top1[1][0], images.size(0))
+                    kingdom_top1.update(layer_top1[2][0], images.size(0))
+
+
+                    # tree_losses.update(tree_loss.item(), images.size(0))
+                    # family_top1.update(layer_top1[1][0], images.size(0))
+                    # order_top1.update(layer_top1[2][0], images.size(0))
+                    # class_top1.update(layer_top1[3][0], images.size(0))
+                    # phylum_top1.update(layer_top1[4][0], images.size(0))
+                    # kingdom_top1.update(layer_top1[5][0], images.size(0))
+
+
 
                 # measure elapsed time
                 batch_time.update(time.time() - end)
@@ -558,22 +756,49 @@ def validate(val_loader, model, criterion, args, summary_writer=None, epoch=None
                 if i % args.print_freq == 0:
                     progress.display(i + 1)
 
+        return confusion_matrix, layers_cm
+
     batch_time = AverageMeter('Time', ':6.3f', Summary.NONE)
     losses = AverageMeter('Loss', ':.4e', Summary.NONE)
     top1 = AverageMeter('Acc@1', ':6.2f', Summary.AVERAGE)
     top5 = AverageMeter('Acc@5', ':6.2f', Summary.AVERAGE)
+    
+    # progress = ProgressMeter(
+    #     len(val_loader) + (args.distributed and (len(val_loader.sampler) * args.world_size < len(val_loader.dataset))),
+    #     [batch_time, losses, top1, top5],
+    #     prefix='Test: ')
+
+    # if args.loss == "tree_layer_loss":
+        #wangcong
+    # family_top1 = AverageMeter('FamilyAcc@1', ':6.2f')
+    # order_top1 = AverageMeter('OrderAcc@1', ':6.2f')
+    class_top1 = AverageMeter('ClassAcc@1', ':6.2f')        
+    phylum_top1 = AverageMeter('PhylumAcc@1', ':6.2f')
+    kingdom_top1 = AverageMeter('KingdomAcc@1', ':6.2f')
+    # class_cm = None
+    # phylum_cm = None
+    # kingdom_cm = None
+        
     progress = ProgressMeter(
         len(val_loader) + (args.distributed and (len(val_loader.sampler) * args.world_size < len(val_loader.dataset))),
-        [batch_time, losses, top1, top5],
+        [batch_time, losses, top1, top5, class_top1, phylum_top1, kingdom_top1],
         prefix='Test: ')
+        # progress = ProgressMeter(
+        #     len(val_loader) + (args.distributed and (len(val_loader.sampler) * args.world_size < len(val_loader.dataset))),
+        #     [batch_time, losses, top1, top5, family_top1, order_top1, class_top1, phylum_top1, kingdom_top1],
+        #     prefix='Test: ')
 
     # switch to evaluate mode
     model.eval()
 
-    run_validate(val_loader)
+    confusion_matrix, layers_cm = run_validate(val_loader)
     if args.distributed:
         top1.all_reduce()
         top5.all_reduce()
+        if args.loss == "tree_layer_loss":
+            class_top1.all_reduce()      
+            phylum_top1.all_reduce()
+            kingdom_top1.all_reduce()
 
     if args.distributed and (len(val_loader.sampler) * args.world_size < len(val_loader.dataset)):
         aux_val_dataset = Subset(val_loader.dataset,
@@ -581,7 +806,9 @@ def validate(val_loader, model, criterion, args, summary_writer=None, epoch=None
         aux_val_loader = torch.utils.data.DataLoader(
             aux_val_dataset, batch_size=args.batch_size, shuffle=False,
             num_workers=args.workers, pin_memory=True)
-        run_validate(aux_val_loader, len(val_loader))
+        a, b = run_validate(aux_val_loader, len(val_loader))
+        confusion_matrix += a
+
 
     progress.display_summary()
 
@@ -590,14 +817,102 @@ def validate(val_loader, model, criterion, args, summary_writer=None, epoch=None
     else:
         if args.rank in {-1, 0} and summary_writer:
             summary_writer.add_scalar('val_loss', losses.avg, epoch)
+            if args.loss == "tree_layer_loss":
+                summary_writer.add_scalars('val_Layer_Acc@1', {'order_top1':top1.avg, 
+                    'class_top1':class_top1.avg, 'phylum_top1':phylum_top1.avg, 'kingdom_top1':kingdom_top1.avg}, epoch)
+
+                # summary_writer.add_scalar('train_tree_loss', tree_losses.avg, epoch)
+                # summary_writer.add_scalars('val_Layer_Acc@1', {'family_top1':family_top1.avg, 'order_top1':order_top1.avg, 
+                #     'class_top1':class_top1.avg, 'phylum_top1':phylum_top1.avg, 'kingdom_top1':kingdom_top1.avg}, epoch)
+    if plot_cm:
+        plot_confusion_matrix(confusion_matrix, range(len(confusion_matrix)), save_dir=args.output_dir)
+        # plt.savefig(args.output_dir + '/confusion_matix.png', dpi=600)
+        if args.loss == "tree_layer_loss":
+            for cm in layers_cm:
+                plot_confusion_matrix(cm, range(len(cm)), save_dir=args.output_dir, 
+                    filename=str(len(cm))+'_'+'confusion_matrix.png')
+                # plt.savefig(args.output_dir + '/' +str(len(cm)) + '_confusion_matix.png', dpi=400)
+
 
     return top1.avg
+
+#计算混淆矩阵
+def cal_confusion_matrix(targets, preds, labels):
+    preds = preds.to('cpu').numpy()
+    targets = targets.to('cpu').numpy()
+    confusion_matrix = metrics.confusion_matrix(targets, preds, labels=labels)
+    return confusion_matrix
+
+#绘制混淆矩阵
+def plot_confusion_matrix(cm, names,
+                          normalize=True, save_dir='', filename='confusion_matrix.png'):
+    # try:
+    import seaborn as sn
+    from pathlib import Path
+
+    matrix = np.array(cm)
+    array = matrix / ((matrix.sum(0).reshape(1, -1) + 1E-9) if normalize else 1)  # normalize columns
+    array[array < 0.005] = np.nan  # don't annotate (would appear as 0.00)
+
+    fig = plt.figure(figsize=(12, 9), tight_layout=True)
+    nc, nn = len(names), len(names)  # number of classes, names
+    sn.set(font_scale=1.0 if nc < 50 else 0.8)  # for label size
+    labels = (0 < nn < 99) and (nn == nc)  # apply names to ticklabels
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore')  # suppress empty matrix RuntimeWarning: All-NaN slice encountered
+        sn.heatmap(array,
+                   annot=nc < 30,
+                   annot_kws={
+                       "size": 8},
+                   cmap='Blues',
+                   fmt='.2f',
+                   square=True,
+                   vmin=0.0,
+                   xticklabels=names if labels else "auto",
+                   yticklabels=names if labels else "auto").set_facecolor((1, 1, 1))
+    fig.axes[0].set_xlabel('True')
+    fig.axes[0].set_ylabel('Predicted')
+    fig.savefig(Path(save_dir) / filename, dpi=250)
+    plt.close()
+    # except Exception as e:
+    #     print(f'WARNING: ConfusionMatrix plot failure: {e}')
+
+    # """
+    # This function prints and plots the confusion matrix.
+    # Normalization can be applied by setting `normalize=True`.
+    # """
+    # if normalize:
+    #     cm = cm.astype('float') / cm.sum(axis=1)[:, np.newaxis]
+    #     print("Normalized confusion matrix")
+    # else:
+    #     print('Confusion matrix, without normalization')
+
+    # print(cm)
+
+    # plt.switch_backend('agg') # AVOID RuntimeError('Invalid DISPLAY variable') when using ssh
+    # plt.imshow(cm, interpolation='nearest', cmap=cmap)
+    # plt.title(title)
+    # plt.colorbar()
+    # tick_marks = np.arange(len(classes))
+    # plt.xticks(tick_marks, classes, rotation=45)
+    # plt.yticks(tick_marks, classes)
+
+    # fmt = '.2f' if normalize else 'd'
+    # thresh = cm.max() / 2.
+    # for i, j in itertools.product(range(cm.shape[0]), range(cm.shape[1])):
+    #     plt.text(j, i, format(cm[i, j], fmt),
+    #              horizontalalignment="center",
+    #              color="white" if cm[i, j] > thresh else "black")
+
+    # plt.ylabel('True label')
+    # plt.xlabel('Predicted label')
+    # plt.tight_layout()
 
 
 def save_checkpoint(state, is_best, dir_path, filename='checkpoint.pth.tar'):
     torch.save(state, os.path.join(dir_path, filename))
     if is_best:
-        shutil.copyfile(filename, os.path.join(dir_path, 'model_best.pth.tar'))
+        shutil.copyfile(os.path.join(dir_path, filename), os.path.join(dir_path, 'model_best.pth.tar'))
 
 class Summary(Enum):
     NONE = 0
