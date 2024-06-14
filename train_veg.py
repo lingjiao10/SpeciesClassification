@@ -21,7 +21,8 @@ import torchvision.transforms as transforms
 from torch.optim.lr_scheduler import StepLR
 from torch.utils.data import Subset
 
-from datasets.inaturalist import INaturalist
+# from datasets.inaturalist2 import INaturalist
+from datasets.vegetablepests import VegetablePests
 from torch.utils.tensorboard import SummaryWriter
 import matplotlib.pyplot as plt
 import numpy as np
@@ -30,6 +31,8 @@ import itertools
 
 from generalized_wasserstein_dice_loss.loss import GeneralizedWassersteinDiceLoss
 from myloss import BCEWithSoftmaxLoss, BCEWithSoftmaxFocalLoss
+
+os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
 
 model_names = sorted(name for name in models.__dict__
     if name.islower() and not name.startswith("__")
@@ -103,7 +106,7 @@ parser.add_argument('--weight-type', type=str, choices=['A', 'B'],
             help="use weight when loss is BCELoss or BCEWithLogitsLoss")
 parser.add_argument('--lr-range-test', action='store_true', help="use CyclicLR scheduler to test the reasonable learning rate range")
 parser.add_argument('--min-lr', '--min-learning-rate', default=0.0001, type=float, metavar='LR', help='minimum learning rate for CyclicLR', dest='min_lr')
-parser.add_argument('--step-size', default=5, type=int, help='step size for reducing the learning rate')
+parser.add_argument('--step-size', default=30, type=int, help='step size for reducing the learning rate')
 
 
 best_acc1 = 0
@@ -181,46 +184,80 @@ def main_worker(gpu, ngpus_per_node, args):
         # valdir = os.path.join(args.data, 'val')
         normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
                                      std=[0.229, 0.224, 0.225])
+ 
+        # root_dir = "/home/h3c/wangcong/.cache/lavis/inaturalist/2021"
+        # train_dataset = INaturalist(root=root_dir, version="train_mini", insecta=True,
+        #     transform=transforms.Compose([
+        #         transforms.RandomResizedCrop(224),
+        #         transforms.RandomHorizontalFlip(),
+        #         transforms.ToTensor(),
+        #         normalize,
+        #     ]))
+        # val_dataset = INaturalist(root=root_dir, version="val", insecta=True,
+        #     transform=transforms.Compose([
+        #         transforms.Resize(256),
+        #         transforms.CenterCrop(224),
+        #         transforms.ToTensor(),
+        #         normalize,
+        #     ]))
 
-        root_dir = '/home/Datasets/iNaturalist'
-        train_dataset = INaturalist(root=root_dir, version='2021_train_mini', target_type=args.target_type, 
-            build_tree=True,
-            load_weight=args.use_weight, 
+        root_dir = "/home/h3c/wangcong/.cache/lavis/vegetable_pests"
+        class_name_txt = os.path.join(root_dir, "classnames.txt")
+        train_dataset = VegetablePests(root=root_dir+'/images/train', 
+            class_name_txt=class_name_txt,
             transform=transforms.Compose([
                 transforms.RandomResizedCrop(224),
                 transforms.RandomHorizontalFlip(),
-                # add new: wangcong
-                # transforms.RandomRotation(0,180),
-                # transforms.AugMix(),
-                # ----------------
                 transforms.ToTensor(),
                 normalize,
             ]))
-        
-        val_dataset = INaturalist(root=root_dir, version='2021_valid', target_type=args.target_type,
+        val_dataset = VegetablePests(root=root_dir+'/images/val', 
+            class_name_txt=class_name_txt,
             transform=transforms.Compose([
                 transforms.Resize(256),
                 transforms.CenterCrop(224),
                 transforms.ToTensor(),
                 normalize,
             ]))
+        test_dataset = VegetablePests(root=root_dir+'/images/test', 
+            class_name_txt=class_name_txt,
+            transform=transforms.Compose([
+                transforms.Resize(256),
+                transforms.CenterCrop(224),
+                transforms.ToTensor(),
+                normalize,
+            ]))
+
+
         
 
     # create model
     if args.dummy:
         num_class =  1000
     else:
-        if 'full' in args.target_type:
-            num_class = 10000
-        else:
-            num_class = len(train_dataset.categories_index[args.target_type[0]])
+        # if 'full' in args.target_type:
+        #     num_class = 10000
+        # else:
+        #     num_class = len(train_dataset.categories_index[args.target_type[0]])
+        num_class = len(train_dataset.all_categories)
 
+    # num_class = 2526 # TODO: Get attribute from dataset
     args.num_class = num_class
     print('num_class', num_class)
 
     if args.pretrained:
         print("=> using pre-trained model '{}'".format(args.arch))
-        model = models.__dict__[args.arch](pretrained=True, num_classes=num_class)
+        model = models.__dict__[args.arch](pretrained=True, num_classes=1000)
+        if(num_class!=1000):
+            if args.arch.startswith('alexnet') or args.arch.startswith('vgg'):
+                model.classifier[6] = nn.Linear(4096, num_class)
+            elif args.arch.startswith('vit'):
+                num_ftrs = model.heads.head.in_features
+                model.heads.head = nn.Linear(num_ftrs, num_class)
+            else:
+                num_ftrs = model.fc.in_features
+                model.fc = nn.Linear(num_ftrs, num_class) #替换最后一层
+        
     else:
         print("=> creating model '{}'".format(args.arch))
         model = models.__dict__[args.arch](num_classes=num_class)
@@ -311,12 +348,14 @@ def main_worker(gpu, ngpus_per_node, args):
     if args.scheduler == 'CyclicLR':
         # GPU并行时再除以GPU个数
         iter_per_epoch = (len(train_dataset) / ngpus_per_node) // args.batch_size
+        args.iter_per_epoch = iter_per_epoch
         print('iter_per_epoch: ', iter_per_epoch)
         scheduler = torch.optim.lr_scheduler.CyclicLR(optimizer,base_lr=args.min_lr, 
             max_lr=args.lr, step_size_up=args.step_size*iter_per_epoch, mode='triangular')
     else:    
         """Sets the learning rate to the initial LR decayed by 10 every 30 epochs"""
-        scheduler = StepLR(optimizer, step_size=30, gamma=0.1)
+        # scheduler = StepLR(optimizer, step_size=30, gamma=0.1)
+        scheduler = StepLR(optimizer, step_size=args.step_size, gamma=0.1)
     
     # optionally resume from a checkpoint
     if args.resume:
@@ -347,9 +386,11 @@ def main_worker(gpu, ngpus_per_node, args):
     if args.distributed:
         train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset)
         val_sampler = torch.utils.data.distributed.DistributedSampler(val_dataset, shuffle=False, drop_last=True)
+        test_sampler = torch.utils.data.distributed.DistributedSampler(test_dataset, shuffle=False, drop_last=True)
     else:
         train_sampler = None
         val_sampler = None
+        test_sampler = None
 
     train_loader = torch.utils.data.DataLoader(
         train_dataset, batch_size=args.batch_size, shuffle=(train_sampler is None),
@@ -359,8 +400,13 @@ def main_worker(gpu, ngpus_per_node, args):
         val_dataset, batch_size=args.batch_size, shuffle=False,
         num_workers=args.workers, pin_memory=True, sampler=val_sampler)
 
-    treelayer_connection = train_dataset.tree_layer_connection #用于分层计算loss，权重固定
-    lamda_list = [[0,0,0,1],[0,0,0.5,0.5],[0.1,0.8,0.1,0],[0.8,0.15,0.05,0]]
+    test_loader = torch.utils.data.DataLoader(
+        test_dataset, batch_size=args.batch_size, shuffle=False,
+        num_workers=args.workers, pin_memory=True, sampler=val_sampler)
+
+    treelayer_connection = []
+    # treelayer_connection = train_dataset.tree_layer_connection #用于分层计算loss，权重固定
+    # lamda_list = [[0,0,0,1],[0,0,0.5,0.5],[0.1,0.8,0.1,0],[0.8,0.15,0.05,0]]
 
     # lamda_list = [[0.05,0.05,0.5,0.4],[0.1,0.5,0.3,0.1],[0.2,0.7,0.1,0],[0.8,0.15,0.05,0]]
 
@@ -374,7 +420,7 @@ def main_worker(gpu, ngpus_per_node, args):
         #     dummy_input = torch.rand(20,3,224,224)
         #     summary_writer.add_graph(model, (dummy_input,))
 
-        validate(val_loader, model, criterion, args, distance_matrix=distance_matrix, treelayer_connection=treelayer_connection, 
+        validate(test_loader, model, criterion, args, distance_matrix=distance_matrix, treelayer_connection=treelayer_connection, 
             device=device, plot_cm=True)
         return
 
@@ -424,6 +470,11 @@ def main_worker(gpu, ngpus_per_node, args):
                 'optimizer' : optimizer.state_dict(),
                 'scheduler' : scheduler.state_dict()
             }, is_best, args.output_dir)
+
+        # test step for vegetable pests dataset 20240529
+        if epoch == args.epochs-1: 
+            acc1 = validate(test_loader, model, criterion, args, summary_writer, epoch, 
+                distance_matrix, treelayer_connection, device, plot_cm=plot_cm)
 
         
 
@@ -545,13 +596,14 @@ def train(train_loader, model, criterion, optimizer, epoch, device, args, summar
                 # print(scheduler.get_last_lr())
                 # summary_writer.add_scalar('LR_range_test', top1.avg, scheduler.get_last_lr()[0]*1000)
                 lr_top1_loss.append([scheduler.get_last_lr()[0], top1.val.cpu(), losses.val])
-                summary_writer.add_scalar('lr', lr.val, i)
-                summary_writer.add_scalar('Acc@1_iter', top1.val, i)
-                summary_writer.add_scalar('loss_iter', losses.val, i)
-                summary_writer.add_scalars('Layer_Acc@1', {'order_top1':top1.val, 
-                'class_top1':class_top1.val, 'phylum_top1':phylum_top1.val, 'kingdom_top1':kingdom_top1.val}, i)
-                # summary_writer.add_scalars('Layer_Acc@1', {'family_top1':family_top1.val, 'order_top1':order_top1.val, 
-                # 'class_top1':class_top1.val, 'phylum_top1':phylum_top1.val, 'kingdom_top1':kingdom_top1.val}, i)
+                summary_writer.add_scalar('lr', lr.val, i + args.iter_per_epoch * epoch)
+                summary_writer.add_scalar('Acc@1_iter', top1.val, i + args.iter_per_epoch * epoch)
+                summary_writer.add_scalar('loss_iter', losses.val, i + args.iter_per_epoch * epoch)
+                if args.loss == "tree_layer_loss":
+                    summary_writer.add_scalars('Layer_Acc@1', {'order_top1':top1.val, 
+                    'class_top1':class_top1.val, 'phylum_top1':phylum_top1.val, 'kingdom_top1':kingdom_top1.val}, i + args.iter_per_epoch * epoch)
+                    # summary_writer.add_scalars('Layer_Acc@1', {'family_top1':family_top1.val, 'order_top1':order_top1.val, 
+                    # 'class_top1':class_top1.val, 'phylum_top1':phylum_top1.val, 'kingdom_top1':kingdom_top1.val}, i)
                 
 
             
@@ -855,39 +907,7 @@ def plot_confusion_matrix(cm, names,
     fig.axes[0].set_ylabel('Predicted')
     fig.savefig(Path(save_dir) / filename, dpi=250)
     plt.close()
-    # except Exception as e:
-    #     print(f'WARNING: ConfusionMatrix plot failure: {e}')
 
-    # """
-    # This function prints and plots the confusion matrix.
-    # Normalization can be applied by setting `normalize=True`.
-    # """
-    # if normalize:
-    #     cm = cm.astype('float') / cm.sum(axis=1)[:, np.newaxis]
-    #     print("Normalized confusion matrix")
-    # else:
-    #     print('Confusion matrix, without normalization')
-
-    # print(cm)
-
-    # plt.switch_backend('agg') # AVOID RuntimeError('Invalid DISPLAY variable') when using ssh
-    # plt.imshow(cm, interpolation='nearest', cmap=cmap)
-    # plt.title(title)
-    # plt.colorbar()
-    # tick_marks = np.arange(len(classes))
-    # plt.xticks(tick_marks, classes, rotation=45)
-    # plt.yticks(tick_marks, classes)
-
-    # fmt = '.2f' if normalize else 'd'
-    # thresh = cm.max() / 2.
-    # for i, j in itertools.product(range(cm.shape[0]), range(cm.shape[1])):
-    #     plt.text(j, i, format(cm[i, j], fmt),
-    #              horizontalalignment="center",
-    #              color="white" if cm[i, j] > thresh else "black")
-
-    # plt.ylabel('True label')
-    # plt.xlabel('Predicted label')
-    # plt.tight_layout()
 
 
 def save_checkpoint(state, is_best, dir_path, filename='checkpoint.pth.tar'):
